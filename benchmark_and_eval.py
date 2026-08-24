@@ -100,41 +100,61 @@ def run_benchmark():
         model = build_model(cfg)
         model, ok = load_weights(model, cfg["ckpt"])
         print(f"  Weights: {'loaded' if ok else 'random (no ckpt)'}")
-        model.to(device).eval()
+        model.eval()
 
         params = sum(p.numel() for p in model.parameters()) / 1e6
         print(f"  Params: {params:.2f} M")
 
+        # FLOPs: always on CPU to avoid GPU OOM
         flops = {}
+        model_cpu = model.cpu()
         for sz in INPUT_SIZES:
-            macs, _ = get_model_complexity_info(model, sz[1:], verbose=False, print_per_layer_stat=False)
-            macs_val = float(macs.replace(" GMACs", "").replace(" GMac", ""))
-            flops[sz] = macs_val
-            print(f"  MACs {sz[2]}x{sz[3]}: {macs_val:.2f} G")
+            try:
+                macs, _ = get_model_complexity_info(model_cpu, sz[1:], verbose=False, print_per_layer_stat=False)
+                if macs is not None:
+                    macs_val = float(macs.replace(" GMACs", "").replace(" GMac", "").replace(" MACs", ""))
+                    flops[sz] = macs_val
+                    print(f"  MACs {sz[2]}x{sz[3]}: {macs_val:.2f} G")
+                else:
+                    flops[sz] = 0.0
+                    print(f"  MACs {sz[2]}x{sz[3]}: N/A")
+            except Exception as e:
+                flops[sz] = 0.0
+                print(f"  MACs {sz[2]}x{sz[3]}: error ({e})")
+        del model_cpu
 
+        # Latency + VRAM: on GPU
         lat = {}
-        for sz in INPUT_SIZES:
-            if device == "cuda":
-                torch.cuda.empty_cache()
-                x = torch.randn(*sz, device=device)
-                with torch.no_grad():
-                    for _ in range(WARMUP): model(x)
-                torch.cuda.synchronize()
-                torch.cuda.reset_peak_memory_stats()
-                times = []
-                with torch.no_grad():
-                    for _ in range(ITERS):
-                        torch.cuda.synchronize()
-                        t0 = time.perf_counter()
-                        model(x)
-                        torch.cuda.synchronize()
-                        times.append((time.perf_counter()-t0)*1000)
-                vram = torch.cuda.max_memory_allocated()/1024**2
-                avg = np.mean(times)
-                lat[sz] = {"ms": avg, "fps": 1000/avg, "vram_mb": vram}
-                print(f"  Lat {sz[2]}x{sz[3]}: {avg:.2f} ms ({1000/avg:.1f} FPS) | VRAM: {vram:.0f} MB")
-                del x
-            else:
+        if device == "cuda":
+            torch.cuda.empty_cache()
+            model.to(device)
+            for sz in INPUT_SIZES:
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+                    x = torch.randn(*sz, device=device)
+                    with torch.no_grad():
+                        for _ in range(WARMUP): model(x)
+                    torch.cuda.synchronize()
+                    times = []
+                    with torch.no_grad():
+                        for _ in range(ITERS):
+                            torch.cuda.synchronize()
+                            t0 = time.perf_counter()
+                            model(x)
+                            torch.cuda.synchronize()
+                            times.append((time.perf_counter()-t0)*1000)
+                    vram = torch.cuda.max_memory_allocated()/1024**2
+                    avg = np.mean(times)
+                    lat[sz] = {"ms": avg, "fps": 1000/avg, "vram_mb": vram}
+                    print(f"  Lat {sz[2]}x{sz[3]}: {avg:.2f} ms ({1000/avg:.1f} FPS) | VRAM: {vram:.0f} MB")
+                    del x
+                except Exception as e:
+                    lat[sz] = None
+                    print(f"  Lat {sz[2]}x{sz[3]}: error ({e})")
+            model.cpu()
+        else:
+            for sz in INPUT_SIZES:
                 lat[sz] = None
 
         results.append({"name": name, "params": params, "flops": flops, "lat": lat})
@@ -149,10 +169,13 @@ def run_benchmark():
         cfg = list(MODEL_CONFIGS.values())[i]
         l256 = r["lat"][(1,3,256,256)]
         l720 = r["lat"][(1,3,720,1280)]
+        f256 = r["flops"].get((1,3,256,256), 0)
+        f720 = r["flops"].get((1,3,720,1280), 0)
+        f256_str = f"{f256:.2f}" if f256 else "N/A"
+        f720_str = f"{f720:.2f}" if f720 else "N/A"
         row = (f"{r['name']:<22}|{cfg['task']:<8}"
                f"|{r['params']:>10.2f}"
-               f"|{r['flops'][(1,3,256,256)]:>11.2f}"
-               f"|{r['flops'][(1,3,720,1280)]:>11.2f}")
+               f"|{f256_str:>11}|{f720_str:>11}")
         if l256:
             row += f"|{l256['ms']:>11.2f}|{l720['ms']:>11.2f}|{l720['fps']:>8.1f}|{l720['vram_mb']:>12.0f}"
         else:
@@ -282,9 +305,14 @@ def print_final_summary(bench_results, eval_results):
         psnr_str = f"{e['psnr']:.2f}" if e["psnr"] else "N/A"
         ssim_str = f"{e['ssim']:.4f}" if e["ssim"] else "N/A"
 
+        f720 = b["flops"].get((1,3,720,1280), 0)
+        f720_str = f"{f720:.2f}" if f720 else "N/A"
+        psnr_str = f"{e['psnr']:.2f}" if e["psnr"] else "N/A"
+        ssim_str = f"{e['ssim']:.4f}" if e["ssim"] else "N/A"
+
         row = (f"{b['name']:<22}|{cfg['task']:<8}"
                f"|{b['params']:>10.2f}"
-               f"|{b['flops'][(1,3,720,1280)]:>9.2f}")
+               f"|{f720_str:>9}")
         if l720:
             row += f"|{l720['ms']:>11.2f}|{l720['fps']:>7.1f}|{l720['vram_mb']:>9.0f}"
         else:
