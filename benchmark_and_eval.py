@@ -108,7 +108,7 @@ def run_benchmark():
         flops = {}
         for sz in INPUT_SIZES:
             macs, _ = get_model_complexity_info(model, sz[1:], verbose=False, print_per_layer_stat=False)
-            macs_val = float(macs.replace(" GMACs", ""))
+            macs_val = float(macs.replace(" GMACs", "").replace(" GMac", ""))
             flops[sz] = macs_val
             print(f"  MACs {sz[2]}x{sz[3]}: {macs_val:.2f} G")
 
