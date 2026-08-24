@@ -9,6 +9,7 @@ import os
 import sys
 import re
 import time
+import gc
 import argparse
 import warnings
 import numpy as np
@@ -127,10 +128,12 @@ def run_benchmark():
         lat = {}
         if device == "cuda":
             torch.cuda.empty_cache()
+            gc.collect()
             model.to(device)
             for sz in INPUT_SIZES:
                 try:
                     torch.cuda.empty_cache()
+                    gc.collect()
                     torch.cuda.reset_peak_memory_stats()
                     x = torch.randn(*sz, device=device)
                     with torch.no_grad():
@@ -149,16 +152,23 @@ def run_benchmark():
                     lat[sz] = {"ms": avg, "fps": 1000/avg, "vram_mb": vram}
                     print(f"  Lat {sz[2]}x{sz[3]}: {avg:.2f} ms ({1000/avg:.1f} FPS) | VRAM: {vram:.0f} MB")
                     del x
+                except torch.cuda.OutOfMemoryError:
+                    lat[sz] = None
+                    print(f"  Lat {sz[2]}x{sz[3]}: OOM (skipped)")
+                    torch.cuda.empty_cache()
+                    gc.collect()
                 except Exception as e:
                     lat[sz] = None
                     print(f"  Lat {sz[2]}x{sz[3]}: error ({e})")
             model.cpu()
+            torch.cuda.empty_cache()
+            gc.collect()
         else:
             for sz in INPUT_SIZES:
                 lat[sz] = None
 
         results.append({"name": name, "params": params, "flops": flops, "lat": lat})
-        del model; torch.cuda.empty_cache()
+        del model; torch.cuda.empty_cache(); gc.collect()
         print()
 
     # Summary table
