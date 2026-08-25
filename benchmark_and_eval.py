@@ -76,6 +76,44 @@ def load_weights(model, path):
     return model, True
 
 
+def compute_macs_analytical(width, enc_blks, mid_blk, dec_blks, h, w):
+    """
+    Tinh FLOPs (MACs) thu cong theo cong thuc trong paper.
+    Moi NAFBlock tai spatial HxW voi channel c: ~6*H*W*c MACs
+    (xem paper Appendix A.1)
+    """
+    total_macs = 0
+    c = width
+    spatial_areas = []  # (h, w, c) tai moi level
+
+    # Encoder
+    for num in enc_blks:
+        macs_per_block = 6 * h * w * c * c  # 6*H*W*c^2
+        total_macs += macs_per_block * num
+        spatial_areas.append((h, w, c))
+        h, w = h // 2, w // 2
+        c = c * 2
+
+    # Middle
+    macs_per_block = 6 * h * w * c * c
+    total_macs += macs_per_block * mid_blk
+    spatial_areas.append((h, w, c))
+
+    # Decoder
+    for num in dec_blks:
+        h, w = h * 2, w * 2
+        c = c // 2
+        macs_per_block = 6 * h * w * c * c
+        total_macs += macs_per_block * num
+
+    # intro conv: 3x3, 3->width
+    total_macs += h * w * 3 * width * 9  # 3x3 conv
+    # ending conv: 3x3, width->3
+    total_macs += h * w * width * 3 * 9
+
+    return total_macs / 1e9  # return in GMACs
+
+
 # ============================================================
 # PART 1: BENCHMARK (Params, FLOPs, Latency, VRAM)
 # ============================================================
@@ -89,8 +127,6 @@ def run_benchmark():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB")
     print(f"PyTorch: {torch.__version__}\n")
-
-    from ptflops import get_model_complexity_info
 
     INPUT_SIZES = [(1, 3, 256, 256), (1, 3, 720, 1280)]
     WARMUP, ITERS = 10, 100
@@ -106,31 +142,13 @@ def run_benchmark():
         params = sum(p.numel() for p in model.parameters()) / 1e6
         print(f"  Params: {params:.2f} M")
 
-        # FLOPs: always on CPU to avoid GPU OOM
-        # Use NAFNet (not NAFNetLocal) to avoid Local_Base init allocating GPU
+        # FLOPs: tinh thu cong, khong dung ptflops
         flops = {}
-        flops_cls = NAFNet  # avoid NAFNetLocal's Local_Base causing CUDA OOM
-        model_flops = flops_cls(img_channel=3, width=cfg["width"],
-                                middle_blk_num=cfg["mid"],
-                                enc_blk_nums=cfg["enc"], dec_blk_nums=cfg["dec"])
-        sd = torch.load(cfg["ckpt"], map_location="cpu")
-        sd = sd.get("params_ema", sd.get("params", sd))
-        model_flops.load_state_dict(sd, strict=True)
-        model_flops.eval().cpu()
         for sz in INPUT_SIZES:
-            try:
-                macs, _ = get_model_complexity_info(model_flops, sz[1:], verbose=False, print_per_layer_stat=False)
-                if macs is not None:
-                    macs_val = float(macs.replace(" GMACs", "").replace(" GMac", "").replace(" MACs", ""))
-                    flops[sz] = macs_val
-                    print(f"  MACs {sz[2]}x{sz[3]}: {macs_val:.2f} G")
-                else:
-                    flops[sz] = 0.0
-                    print(f"  MACs {sz[2]}x{sz[3]}: N/A")
-            except Exception as e:
-                flops[sz] = 0.0
-                print(f"  MACs {sz[2]}x{sz[3]}: error ({e})")
-        del model_flops; gc.collect()
+            _, _, h, w = sz
+            macs = compute_macs_analytical(cfg["width"], cfg["enc"], cfg["mid"], cfg["dec"], h, w)
+            flops[sz] = macs
+            print(f"  MACs {sz[2]}x{sz[3]}: {macs:.2f} G")
 
         # Latency + VRAM: on GPU
         lat = {}
@@ -138,12 +156,41 @@ def run_benchmark():
             torch.cuda.empty_cache()
             gc.collect()
             model.to(device)
-            for sz in INPUT_SIZES:
+
+            # Measure 256x256 first (always fits)
+            try:
+                torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.reset_peak_memory_stats()
+                x = torch.randn(1, 3, 256, 256, device=device)
+                with torch.no_grad():
+                    for _ in range(WARMUP): model(x)
+                torch.cuda.synchronize()
+                times = []
+                with torch.no_grad():
+                    for _ in range(ITERS):
+                        torch.cuda.synchronize()
+                        t0 = time.perf_counter()
+                        model(x)
+                        torch.cuda.synchronize()
+                        times.append((time.perf_counter()-t0)*1000)
+                vram = torch.cuda.max_memory_allocated()/1024**2
+                avg = np.mean(times)
+                lat[(1,3,256,256)] = {"ms": avg, "fps": 1000/avg, "vram_mb": vram}
+                print(f"  Lat 256x256: {avg:.2f} ms ({1000/avg:.1f} FPS) | VRAM: {vram:.0f} MB")
+                del x
+            except Exception as e:
+                lat[(1,3,256,256)] = None
+                print(f"  Lat 256x256: error ({e})")
+
+            # Measure 720x1280 only if enough VRAM (>4GB free)
+            free_mem = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1024**3
+            if free_mem > 4.0:
                 try:
                     torch.cuda.empty_cache()
                     gc.collect()
                     torch.cuda.reset_peak_memory_stats()
-                    x = torch.randn(*sz, device=device)
+                    x = torch.randn(1, 3, 720, 1280, device=device)
                     with torch.no_grad():
                         for _ in range(WARMUP): model(x)
                     torch.cuda.synchronize()
@@ -157,17 +204,21 @@ def run_benchmark():
                             times.append((time.perf_counter()-t0)*1000)
                     vram = torch.cuda.max_memory_allocated()/1024**2
                     avg = np.mean(times)
-                    lat[sz] = {"ms": avg, "fps": 1000/avg, "vram_mb": vram}
-                    print(f"  Lat {sz[2]}x{sz[3]}: {avg:.2f} ms ({1000/avg:.1f} FPS) | VRAM: {vram:.0f} MB")
+                    lat[(1,3,720,1280)] = {"ms": avg, "fps": 1000/avg, "vram_mb": vram}
+                    print(f"  Lat 720x1280: {avg:.2f} ms ({1000/avg:.1f} FPS) | VRAM: {vram:.0f} MB")
                     del x
                 except torch.cuda.OutOfMemoryError:
-                    lat[sz] = None
-                    print(f"  Lat {sz[2]}x{sz[3]}: OOM (skipped)")
+                    lat[(1,3,720,1280)] = None
+                    print(f"  Lat 720x1280: OOM (skipped)")
                     torch.cuda.empty_cache()
                     gc.collect()
                 except Exception as e:
-                    lat[sz] = None
-                    print(f"  Lat {sz[2]}x{sz[3]}: error ({e})")
+                    lat[(1,3,720,1280)] = None
+                    print(f"  Lat 720x1280: error ({e})")
+            else:
+                lat[(1,3,720,1280)] = None
+                print(f"  Lat 720x1280: skipped (only {free_mem:.1f}GB free)")
+
             model.cpu()
             torch.cuda.empty_cache()
             gc.collect()
@@ -189,11 +240,9 @@ def run_benchmark():
         l720 = r["lat"][(1,3,720,1280)]
         f256 = r["flops"].get((1,3,256,256), 0)
         f720 = r["flops"].get((1,3,720,1280), 0)
-        f256_str = f"{f256:.2f}" if f256 else "N/A"
-        f720_str = f"{f720:.2f}" if f720 else "N/A"
         row = (f"{r['name']:<22}|{cfg['task']:<8}"
                f"|{r['params']:>10.2f}"
-               f"|{f256_str:>11}|{f720_str:>11}")
+               f"|{f256:>11.2f}|{f720:>11.2f}")
         if l256:
             row += f"|{l256['ms']:>11.2f}|{l720['ms']:>11.2f}|{l720['fps']:>8.1f}|{l720['vram_mb']:>12.0f}"
         else:
@@ -211,10 +260,9 @@ def run_eval():
     print("  EVALUATE: PSNR / SSIM on test sets")
     print("=" * 90)
 
-    from basicsr.train import parse_options
     from basicsr.data import create_dataloader, create_dataset
     from basicsr.models import create_model
-    from basicsr.utils import get_root_logger, make_exp_dirs, get_time_str
+    from basicsr.utils import get_root_logger, get_time_str
     import tempfile
 
     eval_results = []
@@ -241,14 +289,12 @@ def run_eval():
         yaml.dump(opt, tmp)
         tmp.close()
 
-        # Redirect stdout to capture output
         import io
         old_stdout = sys.stdout
         sys.stdout = mystdout = io.StringIO()
 
         try:
             torch.backends.cudnn.benchmark = True
-            from basicsr.utils.options import dict2str
             from basicsr.utils import get_env_info
             import logging
 
@@ -284,7 +330,6 @@ def run_eval():
         sys.stdout = old_stdout
         os.unlink(tmp.name)
 
-        # Parse metrics from captured output
         output = mystdout.getvalue()
         psnr_match = re.search(r"psnr:\s*([\d.]+)", output)
         ssim_match = re.search(r"ssim:\s*([\d.]+)", output)
@@ -324,13 +369,9 @@ def print_final_summary(bench_results, eval_results):
         ssim_str = f"{e['ssim']:.4f}" if e["ssim"] else "N/A"
 
         f720 = b["flops"].get((1,3,720,1280), 0)
-        f720_str = f"{f720:.2f}" if f720 else "N/A"
-        psnr_str = f"{e['psnr']:.2f}" if e["psnr"] else "N/A"
-        ssim_str = f"{e['ssim']:.4f}" if e["ssim"] else "N/A"
-
         row = (f"{b['name']:<22}|{cfg['task']:<8}"
                f"|{b['params']:>10.2f}"
-               f"|{f720_str:>9}")
+               f"|{f720:>9.2f}")
         if l720:
             row += f"|{l720['ms']:>11.2f}|{l720['fps']:>7.1f}|{l720['vram_mb']:>9.0f}"
         else:
