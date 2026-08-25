@@ -107,11 +107,19 @@ def run_benchmark():
         print(f"  Params: {params:.2f} M")
 
         # FLOPs: always on CPU to avoid GPU OOM
+        # Use NAFNet (not NAFNetLocal) to avoid Local_Base init allocating GPU
         flops = {}
-        model_cpu = model.cpu()
+        flops_cls = NAFNet  # avoid NAFNetLocal's Local_Base causing CUDA OOM
+        model_flops = flops_cls(img_channel=3, width=cfg["width"],
+                                middle_blk_num=cfg["mid"],
+                                enc_blk_nums=cfg["enc"], dec_blk_nums=cfg["dec"])
+        sd = torch.load(cfg["ckpt"], map_location="cpu")
+        sd = sd.get("params_ema", sd.get("params", sd))
+        model_flops.load_state_dict(sd, strict=True)
+        model_flops.eval().cpu()
         for sz in INPUT_SIZES:
             try:
-                macs, _ = get_model_complexity_info(model_cpu, sz[1:], verbose=False, print_per_layer_stat=False)
+                macs, _ = get_model_complexity_info(model_flops, sz[1:], verbose=False, print_per_layer_stat=False)
                 if macs is not None:
                     macs_val = float(macs.replace(" GMACs", "").replace(" GMac", "").replace(" MACs", ""))
                     flops[sz] = macs_val
@@ -122,7 +130,7 @@ def run_benchmark():
             except Exception as e:
                 flops[sz] = 0.0
                 print(f"  MACs {sz[2]}x{sz[3]}: error ({e})")
-        del model_cpu
+        del model_flops; gc.collect()
 
         # Latency + VRAM: on GPU
         lat = {}
