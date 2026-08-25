@@ -271,23 +271,29 @@ def run_eval():
         print(f"\n--- {name} ---")
 
         with open(cfg["yaml_test"]) as f:
-            opt = yaml.safe_load(f)
+            opt_raw = yaml.safe_load(f)
 
+        opt_raw["path"]["pretrain_network_g"] = cfg["ckpt"]
+        opt_raw["val"]["save_img"] = False
+
+        out_dir = f"results/{name}"
+        os.makedirs(out_dir, exist_ok=True)
+        opt_raw["path"]["log"] = out_dir
+        opt_raw["path"]["visualization"] = out_dir
+        opt_raw["path"]["models"] = out_dir
+
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False, dir=".")
+        yaml.dump(opt_raw, tmp)
+        tmp.close()
+
+        # Use parse_options to get all required fields (is_train, phase, etc.)
+        from basicsr.utils.options import parse
+        opt = parse(tmp.name, is_train=False)
         opt["path"]["pretrain_network_g"] = cfg["ckpt"]
         opt["val"]["save_img"] = False
         opt["dist"] = False
         opt["rank"] = 0
         opt["world_size"] = 1
-
-        out_dir = f"results/{name}"
-        os.makedirs(out_dir, exist_ok=True)
-        opt["path"]["log"] = out_dir
-        opt["path"]["visualization"] = out_dir
-        opt["path"]["models"] = out_dir
-
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False, dir=".")
-        yaml.dump(opt, tmp)
-        tmp.close()
 
         import io
         old_stdout = sys.stdout
@@ -304,8 +310,6 @@ def run_eval():
 
             test_loaders = []
             for phase, dataset_opt in sorted(opt["datasets"].items()):
-                if "test" in phase:
-                    dataset_opt["phase"] = "test"
                 test_set = create_dataset(dataset_opt)
                 test_loader = create_dataloader(test_set, dataset_opt, num_gpu=opt["num_gpu"],
                                                 dist=opt["dist"], sampler=None, seed=opt["manual_seed"])
