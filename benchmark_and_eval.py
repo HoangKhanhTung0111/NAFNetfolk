@@ -312,11 +312,11 @@ def run_eval():
             for phase, dataset_opt in sorted(opt["datasets"].items()):
                 test_set = create_dataset(dataset_opt)
                 max_imgs = min(len(test_set), 50)
-                # Wrap dataset to limit number of images
                 class LimitedDataset:
                     def __init__(self, ds, n):
                         self.ds = ds
                         self.n = n
+                        self.opt = ds.opt
                     def __len__(self):
                         return self.n
                     def __getitem__(self, i):
