@@ -262,8 +262,10 @@ def run_eval():
 
     from basicsr.data import create_dataloader, create_dataset
     from basicsr.models import create_model
-    from basicsr.utils import get_root_logger, get_time_str
+    from basicsr.metrics.psnr_ssim import calculate_psnr, calculate_ssim
+    from basicsr.utils import tensor2img, get_root_logger, get_time_str
     import tempfile
+    from tqdm import tqdm
 
     eval_results = []
 
@@ -286,7 +288,6 @@ def run_eval():
         yaml.dump(opt_raw, tmp)
         tmp.close()
 
-        # Use parse_options to get all required fields (is_train, phase, etc.)
         from basicsr.utils.options import parse
         opt = parse(tmp.name, is_train=False)
         opt["path"]["pretrain_network_g"] = cfg["ckpt"]
@@ -295,20 +296,11 @@ def run_eval():
         opt["rank"] = 0
         opt["world_size"] = 1
 
-        import io
-        old_stdout = sys.stdout
-        sys.stdout = mystdout = io.StringIO()
-
         try:
             torch.backends.cudnn.benchmark = True
             from basicsr.utils import get_env_info
-            import logging
 
-            log_file = os.path.join(out_dir, f"test_{name}_{get_time_str()}.log")
-            logger = get_root_logger(logger_name="basicsr", log_level=logging.INFO, log_file=log_file)
-            logger.info(get_env_info())
-
-            test_loaders = []
+            # Create dataloader
             for phase, dataset_opt in sorted(opt["datasets"].items()):
                 test_set = create_dataset(dataset_opt)
                 max_imgs = min(len(test_set), 50)
@@ -324,44 +316,59 @@ def run_eval():
                 test_set_limited = LimitedDataset(test_set, max_imgs)
                 test_loader = create_dataloader(test_set_limited, dataset_opt, num_gpu=opt["num_gpu"],
                                                 dist=opt["dist"], sampler=None, seed=opt["manual_seed"])
-                logger.info(f"Number of test images: {max_imgs} (of {len(test_set)} total)")
-                test_loaders.append(test_loader)
 
+            # Create model
             model = create_model(opt)
 
-            for test_loader in test_loaders:
-                model.validation(test_loader, current_iter=opt["name"], tb_logger=None,
-                                 save_img=opt["val"]["save_img"], rgb2bgr=opt["val"].get("rgb2bgr", True),
-                                 use_image=opt["val"].get("use_image", True))
+            # Custom validation loop - no distributed
+            print(f"  Evaluating {max_imgs} images...")
+            psnr_total = 0.0
+            ssim_total = 0.0
+            count = 0
 
-        except Exception as e:
-            sys.stdout = old_stdout
-            print(f"  [ERROR] {e}")
-            import traceback; traceback.print_exc()
-            os.unlink(tmp.name)
-            eval_results.append({"name": name, "psnr": None, "ssim": None})
-            continue
+            model.net_g.eval()
+            with torch.no_grad():
+                for data in tqdm(test_loader, desc=f"  {name}", ncols=80):
+                    model.feed_data(data, is_val=True)
+                    model.test()
+                    visuals = model.get_current_visuals()
 
-        sys.stdout = old_stdout
-        os.unlink(tmp.name)
+                    sr_img = tensor2img([visuals['result']], rgb2bgr=True)
+                    gt_img = tensor2img([visuals['gt']], rgb2bgr=True)
 
-        output = mystdout.getvalue()
-        psnr_match = re.search(r"psnr:\s*([\d.]+)", output)
-        ssim_match = re.search(r"ssim:\s*([\d.]+)", output)
+                    psnr_total += calculate_psnr(sr_img, gt_img, crop_border=0, test_y_channel=False)
+                    ssim_total += calculate_ssim(sr_img, gt_img, crop_border=0, test_y_channel=False)
+                    count += 1
 
-        psnr = float(psnr_match.group(1)) if psnr_match else None
-        ssim = float(ssim_match.group(1)) if ssim_match else None
+                    del model.lq, model.output
+                    if hasattr(model, 'gt'):
+                        del model.gt
+                    torch.cuda.empty_cache()
 
-        print(f"  PSNR: {psnr:.4f} dB" if psnr else "  PSNR: N/A")
-        print(f"  SSIM: {ssim:.4f}" if ssim else "  SSIM: N/A")
-        print(f"  Paper: {cfg['paper_psnr']} dB / {cfg['paper_ssim']}")
+            psnr_avg = psnr_total / count if count > 0 else 0
+            ssim_avg = ssim_total / count if count > 0 else 0
 
-        diff = psnr - cfg["paper_psnr"] if psnr else None
-        if diff is not None:
+            print(f"  PSNR: {psnr_avg:.4f} dB")
+            print(f"  SSIM: {ssim_avg:.4f}")
+            print(f"  Paper: {cfg['paper_psnr']} dB / {cfg['paper_ssim']}")
+
+            diff = psnr_avg - cfg["paper_psnr"]
             tag = "OK" if abs(diff) < 0.5 else "CHECK"
             print(f"  Delta: {diff:+.4f} dB [{tag}]")
 
-        eval_results.append({"name": name, "psnr": psnr, "ssim": ssim})
+            eval_results.append({"name": name, "psnr": psnr_avg, "ssim": ssim_avg})
+
+        except Exception as e:
+            print(f"  [ERROR] {e}")
+            import traceback; traceback.print_exc()
+            eval_results.append({"name": name, "psnr": None, "ssim": None})
+
+        finally:
+            os.unlink(tmp.name)
+            if 'model' in dir():
+                del model
+            torch.cuda.empty_cache()
+            gc.collect()
 
     return eval_results
 
