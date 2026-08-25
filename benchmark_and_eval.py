@@ -268,6 +268,7 @@ def run_eval():
     from tqdm import tqdm
 
     eval_results = []
+    datasets_to_close = []
 
     for name, cfg in MODEL_CONFIGS.items():
         print(f"\n--- {name} ---")
@@ -303,6 +304,7 @@ def run_eval():
             # Create dataloader
             for phase, dataset_opt in sorted(opt["datasets"].items()):
                 test_set = create_dataset(dataset_opt)
+                datasets_to_close.append(test_set)
                 max_imgs = min(len(test_set), 50)
                 class LimitedDataset:
                     def __init__(self, ds, n):
@@ -365,8 +367,23 @@ def run_eval():
 
         finally:
             os.unlink(tmp.name)
+            # Close all LMDB file clients to prevent "already open" error
+            for ds in datasets_to_close:
+                if hasattr(ds, 'file_client') and ds.file_client is not None:
+                    if ds.file_client.backend == 'lmdb':
+                        try:
+                            for env in ds.file_client.client._client.values():
+                                env.close()
+                        except:
+                            pass
+                    ds.file_client = None
+            datasets_to_close.clear()
             if 'model' in dir():
                 del model
+            if 'test_loader' in dir():
+                del test_loader
+            if 'test_set' in dir():
+                del test_set
             torch.cuda.empty_cache()
             gc.collect()
 
