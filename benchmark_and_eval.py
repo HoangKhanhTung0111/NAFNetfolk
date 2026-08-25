@@ -311,9 +311,20 @@ def run_eval():
             test_loaders = []
             for phase, dataset_opt in sorted(opt["datasets"].items()):
                 test_set = create_dataset(dataset_opt)
-                test_loader = create_dataloader(test_set, dataset_opt, num_gpu=opt["num_gpu"],
+                max_imgs = min(len(test_set), 50)
+                # Wrap dataset to limit number of images
+                class LimitedDataset:
+                    def __init__(self, ds, n):
+                        self.ds = ds
+                        self.n = n
+                    def __len__(self):
+                        return self.n
+                    def __getitem__(self, i):
+                        return self.ds[i]
+                test_set_limited = LimitedDataset(test_set, max_imgs)
+                test_loader = create_dataloader(test_set_limited, dataset_opt, num_gpu=opt["num_gpu"],
                                                 dist=opt["dist"], sampler=None, seed=opt["manual_seed"])
-                logger.info(f"Number of test images: {len(test_set)}")
+                logger.info(f"Number of test images: {max_imgs} (of {len(test_set)} total)")
                 test_loaders.append(test_loader)
 
             model = create_model(opt)
